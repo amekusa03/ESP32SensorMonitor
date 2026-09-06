@@ -1,0 +1,15 @@
+# ESP-IDF
+build/
+sdkconfig
+sdkconfig.old
+dependencies.lock
+managed_components/
+
+# Secrets (Wi-Fi情報など)
+main/secrets.h
+
+# IDE / Editor
+.vscode/
+.idea/
+*.swp
+*~
