@@ -14,6 +14,7 @@
 #include "esp_sntp.h"
 #include "driver/gpio.h"
 #include "driver/spi_master.h"
+#include "driver/ledc.h"
 #include "esp_lcd_panel_io.h"
 #include "esp_lcd_panel_vendor.h"
 #include "esp_lcd_panel_ops.h"
@@ -55,9 +56,11 @@ static const char *TAG = "ESP32Clock";
 #define COLOR_CARD_BG   SWAP16(RGB565(18, 24, 38))     // カード背景
 #define COLOR_BORDER    SWAP16(RGB565(36, 48, 70))     // 枠線
 #define COLOR_WHITE     SWAP16(0xFFFF)
-#define COLOR_CYAN      SWAP16(RGB565(0, 230, 230))    // アクセント水色
-#define COLOR_ORANGE    SWAP16(RGB565(255, 150, 25))   // 温度用オレンジ
-#define COLOR_YELLOW    SWAP16(RGB565(255, 215, 45))   // 照度用イエロー
+#define COLOR_CYAN      SWAP16(RGB565(0, 230, 230))    // アクセント水色 (20〜25℃)
+#define COLOR_BLUE      SWAP16(RGB565(50, 140, 255))   // 温度用ブルー (〜20℃)
+#define COLOR_ORANGE    SWAP16(RGB565(255, 150, 25))   // オレンジ
+#define COLOR_YELLOW    SWAP16(RGB565(255, 215, 45))   // 照度 / 温度用イエロー (28〜30℃)
+#define COLOR_RED       SWAP16(RGB565(255, 60, 60))    // 温度用レッド (30℃〜)
 #define COLOR_GRAY      SWAP16(RGB565(135, 150, 170))  // サブテキストグレー
 
 static esp_lcd_panel_handle_t panel_handle = NULL;
@@ -71,6 +74,25 @@ static portMUX_TYPE sensor_mux = portMUX_INITIALIZER_UNLOCKED;
 static float g_sensor_temp = 0.0f;
 static float g_sensor_lux  = 0.0f;
 static bool  g_sensor_valid = false;
+
+// 温度に応じた表示カラーを取得
+// 〜20℃: 青, 20〜25℃: 水色, 25〜28℃: 白, 28〜30℃: 黄色, 30℃〜: 赤
+static uint16_t get_temp_color(float temp, bool is_valid) {
+    if (!is_valid) {
+        return COLOR_GRAY;
+    }
+    if (temp < 20.0f) {
+        return COLOR_BLUE;
+    } else if (temp < 25.0f) {
+        return COLOR_CYAN;
+    } else if (temp < 28.0f) {
+        return COLOR_WHITE;
+    } else if (temp < 30.0f) {
+        return COLOR_YELLOW;
+    } else {
+        return COLOR_RED;
+    }
+}
 
 // =========================================================================
 // 8x16 ビットマップフォントテーブル (統一フォント)
@@ -189,15 +211,69 @@ static void draw_string(int x, int y, const char *str, uint16_t color, int scale
 }
 
 // =========================================================================
+// LCD バックライト LEDC PWM 自動調光
+// =========================================================================
+#define LCD_BK_LIGHT_TIMER       LEDC_TIMER_0
+#define LCD_BK_LIGHT_MODE        LEDC_LOW_SPEED_MODE
+#define LCD_BK_LIGHT_CHANNEL     LEDC_CHANNEL_0
+#define LCD_BK_LIGHT_DUTY_RES    LEDC_TIMER_8_BIT // 0 - 255
+#define LCD_BK_LIGHT_FREQ_HZ     5000
+
+static void init_backlight_pwm(void) {
+    ledc_timer_config_t ledc_timer = {
+        .speed_mode       = LCD_BK_LIGHT_MODE,
+        .timer_num        = LCD_BK_LIGHT_TIMER,
+        .duty_resolution  = LCD_BK_LIGHT_DUTY_RES,
+        .freq_hz          = LCD_BK_LIGHT_FREQ_HZ,
+        .clk_cfg          = LEDC_AUTO_CLK
+    };
+    ESP_ERROR_CHECK(ledc_timer_config(&ledc_timer));
+
+    ledc_channel_config_t ledc_channel = {
+        .speed_mode     = LCD_BK_LIGHT_MODE,
+        .channel        = LCD_BK_LIGHT_CHANNEL,
+        .timer_sel      = LCD_BK_LIGHT_TIMER,
+        .intr_type      = LEDC_INTR_DISABLE,
+        .gpio_num       = PIN_NUM_BK_LIGHT,
+        .duty           = 255, // 起動時は100%
+        .hpoint         = 0
+    };
+    ESP_ERROR_CHECK(ledc_channel_config(&ledc_channel));
+    ledc_fade_func_install(0);
+}
+
+// 照度に応じた目標デューティ比を計算して滑らかに調光 (500ms フェード)
+static void update_backlight_by_lux(float lux, bool is_valid) {
+    static uint32_t last_duty = 255;
+    uint32_t target_duty = 255;
+    if (is_valid) {
+        if (lux <= 2.0f) {
+            target_duty = 25; // 最低10% (暗闇・就寝時)
+        } else if (lux < 20.0f) {
+            // 2lx(25) 〜 20lx(100) へ滑らかに補間
+            target_duty = 25 + (uint32_t)((lux - 2.0f) / 18.0f * (100 - 25));
+        } else if (lux < 100.0f) {
+            // 20lx(100) 〜 100lx(255) へ滑らかに補間
+            target_duty = 100 + (uint32_t)((lux - 20.0f) / 80.0f * (255 - 100));
+        } else {
+            target_duty = 255; // 100lx以上は100%
+        }
+    }
+    if (target_duty > 255) target_duty = 255;
+    if (target_duty < 25) target_duty = 25;
+
+    if (target_duty != last_duty) {
+        last_duty = target_duty;
+        ledc_set_fade_with_time(LCD_BK_LIGHT_MODE, LCD_BK_LIGHT_CHANNEL, target_duty, 500);
+        ledc_fade_start(LCD_BK_LIGHT_MODE, LCD_BK_LIGHT_CHANNEL, LEDC_FADE_NO_WAIT);
+    }
+}
+
+// =========================================================================
 // LCD ST7789 初期化
 // =========================================================================
 static void init_lcd(void) {
-    gpio_config_t bk_gpio_config = {
-        .mode = GPIO_MODE_OUTPUT,
-        .pin_bit_mask = 1ULL << PIN_NUM_BK_LIGHT
-    };
-    gpio_config(&bk_gpio_config);
-    gpio_set_level(PIN_NUM_BK_LIGHT, 1);
+    init_backlight_pwm();
 
     spi_bus_config_t buscfg = {
         .sclk_io_num = PIN_NUM_SCLK,
@@ -413,6 +489,8 @@ static void clock_task(void *pvParameters) {
             is_valid = g_sensor_valid;
             portEXIT_CRITICAL(&sensor_mux);
 
+            update_backlight_by_lux(cur_lux, is_valid);
+
             fill_rect(10, 42, 300, 78, COLOR_CARD_BG);
             draw_round_rect(10, 42, 300, 78, 4, COLOR_BORDER);
             draw_string(20, 48, "ROOM TEMP", COLOR_GRAY, 1);
@@ -426,7 +504,8 @@ static void clock_task(void *pvParameters) {
             int text_len = strlen(temp_main_str);
             int text_width = text_len * (8 * 4);
             int text_x = 10 + (300 - text_width) / 2;
-            draw_string(text_x, 52, temp_main_str, COLOR_ORANGE, 4);
+            uint16_t temp_color = get_temp_color(cur_temp, is_valid);
+            draw_string(text_x, 52, temp_main_str, temp_color, 4);
 
             // -------------------------------------------------------------
             // 3. フッターエリア: 照度 (LUX)

@@ -13,3 +13,6 @@ main/secrets.h
 .idea/
 *.swp
 *~
+
+# others
+pict/
