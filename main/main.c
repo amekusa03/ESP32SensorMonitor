@@ -22,7 +22,7 @@
 #include "cJSON.h"
 #include "mdns.h"
 
-// Wi-Fi 認証情報ファイル読み込み (Git管理外)
+// Load Wi-Fi credentials (excluded from Git)
 #if __has_include("secrets.h")
 #include "secrets.h"
 #else
@@ -31,10 +31,10 @@
 
 static const char *TAG = "ESP32Clock";
 
-// Web API 設定 (SwitchBot + sensor ボード)
+// Web API configuration (SwitchBot + sensor board)
 #define SENSOR_API_URL "http://esp32-switchbot.local/api/sensor"
 
-// LCD ピンアサイン (ボード仕様)
+// LCD pin assignment (board specification)
 #define LCD_HOST       SPI2_HOST
 #define PIN_NUM_SCLK   18
 #define PIN_NUM_MOSI   23
@@ -44,24 +44,24 @@ static const char *TAG = "ESP32Clock";
 #define PIN_NUM_LCD_CS 15
 #define PIN_NUM_BK_LIGHT 32
 
-// LCD 解像度 (横画面)
+// LCD resolution (landscape)
 #define LCD_H_RES      320
 #define LCD_V_RES      170
 
-// カラー定義 (RGB565)
-#define RGB565(r, g, b) (((((r) >> 3) & 0x1F) << 11) | ((((g) >> 2) & 0x3F) << 5) | (((b) >> 3) & 0x1F))
-#define SWAP16(v) ((((v) & 0xFF) << 8) | (((v) >> 8) & 0xFF))
+// Color definition macros (RGB565 & Endian swap for ST7789)
+#define RGB565(r, g, b) ((((r) & 0xF8) << 8) | (((g) & 0xFC) << 3) | (((b) & 0xF8) >> 3))
+#define SWAP16(x)       ((uint16_t)(((uint16_t)(x) << 8) | ((uint16_t)(x) >> 8)))
 
-#define COLOR_BG        SWAP16(RGB565(10, 14, 24))     // 背景ダークネイビー
-#define COLOR_CARD_BG   SWAP16(RGB565(18, 24, 38))     // カード背景
-#define COLOR_BORDER    SWAP16(RGB565(36, 48, 70))     // 枠線
+#define COLOR_BG        SWAP16(RGB565(10, 14, 24))     // Dark navy background
+#define COLOR_CARD_BG   SWAP16(RGB565(18, 24, 38))     // Card background
+#define COLOR_BORDER    SWAP16(RGB565(36, 48, 70))     // Border
 #define COLOR_WHITE     SWAP16(0xFFFF)
-#define COLOR_CYAN      SWAP16(RGB565(0, 230, 230))    // アクセント水色 (20〜25℃)
-#define COLOR_BLUE      SWAP16(RGB565(50, 140, 255))   // 温度用ブルー (〜20℃)
-#define COLOR_ORANGE    SWAP16(RGB565(255, 150, 25))   // オレンジ
-#define COLOR_YELLOW    SWAP16(RGB565(255, 215, 45))   // 照度 / 温度用イエロー (28〜30℃)
-#define COLOR_RED       SWAP16(RGB565(255, 60, 60))    // 温度用レッド (30℃〜)
-#define COLOR_GRAY      SWAP16(RGB565(135, 150, 170))  // サブテキストグレー
+#define COLOR_CYAN      SWAP16(RGB565(0, 230, 230))    // Cyan accent (20-25 deg C)
+#define COLOR_BLUE      SWAP16(RGB565(50, 140, 255))   // Blue for cool temp (<20 deg C)
+#define COLOR_ORANGE    SWAP16(RGB565(255, 150, 25))   // Orange
+#define COLOR_YELLOW    SWAP16(RGB565(255, 215, 45))   // Yellow for illuminance / warm temp (28-30 deg C)
+#define COLOR_RED       SWAP16(RGB565(255, 60, 60))    // Red for hot temp (>=30 deg C)
+#define COLOR_GRAY      SWAP16(RGB565(135, 150, 170))  // Gray for subtext
 
 static esp_lcd_panel_handle_t panel_handle = NULL;
 static uint16_t *frame_buffer = NULL;
@@ -69,14 +69,14 @@ static uint16_t *frame_buffer = NULL;
 static EventGroupHandle_t s_wifi_event_group;
 #define WIFI_CONNECTED_BIT BIT0
 
-// センサーデータ保持用
+// Sensor data storage
 static portMUX_TYPE sensor_mux = portMUX_INITIALIZER_UNLOCKED;
 static float g_sensor_temp = 0.0f;
 static float g_sensor_lux  = 0.0f;
 static bool  g_sensor_valid = false;
 
-// 温度に応じた表示カラーを取得
-// 〜20℃: 青, 20〜25℃: 水色, 25〜28℃: 白, 28〜30℃: 黄色, 30℃〜: 赤
+// Get display color according to temperature
+// <20C: Blue, 20-25C: Cyan, 25-28C: White, 28-30C: Yellow, >=30C: Red
 static uint16_t get_temp_color(float temp, bool is_valid) {
     if (!is_valid) {
         return COLOR_GRAY;
@@ -95,7 +95,7 @@ static uint16_t get_temp_color(float temp, bool is_valid) {
 }
 
 // =========================================================================
-// 8x16 ビットマップフォントテーブル (統一フォント)
+// 8x16 bitmap font table (unified font)
 // =========================================================================
 static const uint8_t font_table[][16] = {
     // 0: ' '
@@ -172,7 +172,7 @@ static const uint8_t* get_font_glyph(char c) {
 }
 
 // =========================================================================
-// 描画プリミティブ
+// Drawing primitives
 // =========================================================================
 static void fill_rect(int x, int y, int w, int h, uint16_t color) {
     for (int j = y; j < y + h; j++) {
@@ -192,7 +192,7 @@ static void draw_round_rect(int x, int y, int w, int h, int r, uint16_t color) {
     fill_rect(x + w - 1, y + r, 1, h - 2 * r, color);
 }
 
-// 文字列描画 (拡大スケール対応)
+// Draw string with scaling
 static void draw_string(int x, int y, const char *str, uint16_t color, int scale) {
     int cur_x = x;
     while (*str) {
@@ -211,7 +211,7 @@ static void draw_string(int x, int y, const char *str, uint16_t color, int scale
 }
 
 // =========================================================================
-// LCD バックライト LEDC PWM 自動調光
+// LCD Backlight LEDC PWM Auto-Dimming
 // =========================================================================
 #define LCD_BK_LIGHT_TIMER       LEDC_TIMER_0
 #define LCD_BK_LIGHT_MODE        LEDC_LOW_SPEED_MODE
@@ -235,28 +235,28 @@ static void init_backlight_pwm(void) {
         .timer_sel      = LCD_BK_LIGHT_TIMER,
         .intr_type      = LEDC_INTR_DISABLE,
         .gpio_num       = PIN_NUM_BK_LIGHT,
-        .duty           = 255, // 起動時は100%
+        .duty           = 255, // 100% on startup
         .hpoint         = 0
     };
     ESP_ERROR_CHECK(ledc_channel_config(&ledc_channel));
     ledc_fade_func_install(0);
 }
 
-// 照度に応じた目標デューティ比を計算して滑らかに調光 (500ms フェード)
+// Calculate target duty cycle according to illuminance and smoothly fade (500ms)
 static void update_backlight_by_lux(float lux, bool is_valid) {
     static uint32_t last_duty = 255;
     uint32_t target_duty = 255;
     if (is_valid) {
         if (lux <= 2.0f) {
-            target_duty = 25; // 最低10% (暗闇・就寝時)
+            target_duty = 25; // Minimum 10% (dark / sleeping time)
         } else if (lux < 20.0f) {
-            // 2lx(25) 〜 20lx(100) へ滑らかに補間
+            // Smoothly interpolate from 2lx (25) to 20lx (100)
             target_duty = 25 + (uint32_t)((lux - 2.0f) / 18.0f * (100 - 25));
         } else if (lux < 100.0f) {
-            // 20lx(100) 〜 100lx(255) へ滑らかに補間
+            // Smoothly interpolate from 20lx (100) to 100lx (255)
             target_duty = 100 + (uint32_t)((lux - 20.0f) / 80.0f * (255 - 100));
         } else {
-            target_duty = 255; // 100lx以上は100%
+            target_duty = 255; // 100% for >= 100lx
         }
     }
     if (target_duty > 255) target_duty = 255;
@@ -270,7 +270,7 @@ static void update_backlight_by_lux(float lux, bool is_valid) {
 }
 
 // =========================================================================
-// LCD ST7789 初期化
+// LCD ST7789 Initialization
 // =========================================================================
 static void init_lcd(void) {
     init_backlight_pwm();
@@ -317,7 +317,7 @@ static void init_lcd(void) {
 }
 
 // =========================================================================
-// SwitchBot+sensor Web API 取得タスク (HTTP GET)
+// SwitchBot + sensor Web API Fetch Task (HTTP GET)
 // =========================================================================
 static void fetch_sensor_data(void) {
     char response_buffer[1024] = {0};
@@ -382,7 +382,7 @@ static void sensor_task(void *pvParameters) {
 }
 
 // =========================================================================
-// Wi-Fi & SNTP 初期化
+// Wi-Fi & SNTP Initialization
 // =========================================================================
 static void wifi_event_handler(void* arg, esp_event_base_t event_base,
                                 int32_t event_id, void* event_data) {
@@ -433,7 +433,7 @@ static void init_wifi_sntp(void) {
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
     ESP_ERROR_CHECK(esp_wifi_start());
 
-    // SNTP 初期化 (JST: UTC+9)
+    // Initialize SNTP (JST: UTC+9)
     esp_sntp_setoperatingmode(SNTP_OPMODE_POLL);
     esp_sntp_setservername(0, "ntp.nict.jp");
     esp_sntp_setservername(1, "time.google.com");
@@ -444,7 +444,7 @@ static void init_wifi_sntp(void) {
 }
 
 // =========================================================================
-// メイン画面更新タスク
+// Main Display Update Task
 // =========================================================================
 static const char* days_full[] = {"SUNDAY", "MONDAY", "TUESDAY", "WEDNESDAY", "THURSDAY", "FRIDAY", "SATURDAY"};
 
@@ -460,7 +460,7 @@ static void clock_task(void *pvParameters) {
 
         if (timeinfo.tm_year > (2020 - 1900)) {
             // -------------------------------------------------------------
-            // 1. ヘッダー: 年月日・曜日 (左) ＆ 時計 (右: scale=2)
+            // 1. Header: Date / Day (Left) & Time (Right: scale=2)
             // -------------------------------------------------------------
             char date_day_buf[64];
             snprintf(date_day_buf, sizeof(date_day_buf), "%04d/%02d/%02d (%s)",
@@ -477,7 +477,7 @@ static void clock_task(void *pvParameters) {
             fill_rect(10, 36, 300, 1, COLOR_BORDER);
 
             // -------------------------------------------------------------
-            // 2. メインエリア: 温度を特大表示 (中央カード: scale=4)
+            // 2. Main area: Large temperature display (Center card: scale=4)
             // -------------------------------------------------------------
             float cur_temp = 0.0f;
             float cur_lux  = 0.0f;
@@ -508,7 +508,7 @@ static void clock_task(void *pvParameters) {
             draw_string(text_x, 52, temp_main_str, temp_color, 4);
 
             // -------------------------------------------------------------
-            // 3. フッターエリア: 照度 (LUX)
+            // 3. Footer area: Ambient illuminance (LUX)
             // -------------------------------------------------------------
             fill_rect(10, 126, 300, 36, COLOR_CARD_BG);
             draw_round_rect(10, 126, 300, 36, 3, COLOR_BORDER);

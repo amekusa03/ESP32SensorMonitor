@@ -1,5 +1,7 @@
 # ESP32 1.9" LCD Smart Clock & Environment Monitor
 
+[English README](README.md) | 日本語
+
 ESP32 と 1.9インチ IPS液晶（ST7789）を搭載したボード上で動作する、**Wi-Fi NTP同期デジタル時計 兼 室内環境モニター** です。  
 ESP-IDF 標準の `esp_lcd` ドライバと内部 DMA フレームバッファを採用し、チラつきのない高速で滑らかな描画を実現しています。
 
@@ -12,6 +14,8 @@ ESP-IDF 標準の `esp_lcd` ドライバと内部 DMA フレームバッファ�
   - ローカルネットワーク上のセンサーデバイス（`http://esp32-switchbot.local/api/sensor`）から mDNS 経由で定期取得
   - **室温（TEMP）** を画面中央に特大フォントで強調表示
   - **明るさ（BRIGHTNESS / LUX）** を下部にリアルタイム表示
+- **自動調光（Auto-Dimming）**:
+  - 照度センサー値に応じて液晶バックライト輝度を PWM でスムーズに自動調整
 - **視認性に優れたUIデザイン**:
   - 統一されたビットマップフォントによるモダンなダークテーマUI
   - 320×170 横画面レイアウト
@@ -61,11 +65,12 @@ ESP-IDF 標準の `esp_lcd` ドライバと内部 DMA フレームバッファ�
 ## 📁 ディレクトリ構成
 
 ```text
-ESP32Clock/
+ESP32SensorMonitor/
 ├── CMakeLists.txt              # プロジェクトルート CMake 設定
 ├── sdkconfig.defaults          # 16MB Flash等のデフォルト設定
 ├── .gitignore                  # Git除外設定 (秘密情報やビルド成果物)
-├── readme.md                   # 本ドキュメント
+├── README.md                   # 英語版ドキュメント
+├── README.JP.md                # 日本語版ドキュメント
 └── main/
     ├── CMakeLists.txt          # コンポーネント依存関係
     ├── idf_component.yml       # mDNS などのコンポーネント依存
