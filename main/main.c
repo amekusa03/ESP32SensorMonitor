@@ -21,6 +21,7 @@
 #include "esp_http_client.h"
 #include "cJSON.h"
 #include "mdns.h"
+#include "font_32x64.h"
 
 // Load Wi-Fi credentials (excluded from Git)
 #if __has_include("secrets.h")
@@ -206,6 +207,34 @@ static void draw_string(int x, int y, const char *str, uint16_t color, int scale
             }
         }
         cur_x += 8 * scale;
+        str++;
+    }
+}
+
+// Draw 32x64 high-resolution string (smooth native bitmap font for temperature display)
+static void draw_string_32x64(int x, int y, const char *str, uint16_t color) {
+    int cur_x = x;
+    while (*str) {
+        const uint8_t *glyph = get_font_32x64_glyph(*str);
+        if (glyph) {
+            for (int row = 0; row < 64; row++) {
+                int py = y + row;
+                if (py < 0 || py >= LCD_V_RES) continue;
+                for (int b = 0; b < 4; b++) {
+                    uint8_t byte_val = glyph[row * 4 + b];
+                    if (byte_val == 0) continue;
+                    for (int bit = 0; bit < 8; bit++) {
+                        if (byte_val & (0x80 >> bit)) {
+                            int px = cur_x + b * 8 + bit;
+                            if (px >= 0 && px < LCD_H_RES) {
+                                frame_buffer[py * LCD_H_RES + px] = color;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        cur_x += 32;
         str++;
     }
 }
@@ -502,10 +531,10 @@ static void clock_task(void *pvParameters) {
                 snprintf(temp_main_str, sizeof(temp_main_str), "--.- C");
             }
             int text_len = strlen(temp_main_str);
-            int text_width = text_len * (8 * 4);
+            int text_width = text_len * 32;
             int text_x = 10 + (300 - text_width) / 2;
             uint16_t temp_color = get_temp_color(cur_temp, is_valid);
-            draw_string(text_x, 52, temp_main_str, temp_color, 4);
+            draw_string_32x64(text_x, 50, temp_main_str, temp_color);
 
             // -------------------------------------------------------------
             // 3. Footer area: Ambient illuminance (LUX)
