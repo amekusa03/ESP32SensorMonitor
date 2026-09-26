@@ -14,6 +14,12 @@ Powered by ESP-IDF's native `esp_lcd` driver and internal DMA frame buffering to
   - Periodically fetches environmental metrics via mDNS from local network sensor nodes (`http://esp32-switchbot.local/api/sensor`).
   - **Room Temperature (TEMP)**: Prominently displayed in extra-large scale font with dynamic color mapping based on temperature range.
   - **Ambient Illuminance (BRIGHTNESS / LUX)**: Real-time illuminance monitor in the lower card section.
+- **6-Hour Temperature History Graph**:
+  - Records temperature every minute (up to 360 data points) in a ring buffer.
+  - Displays a live polyline graph with filled area and auto-scaling Y-axis at the bottom of the screen.
+  - Color of the graph line dynamically matches the temperature range color scheme.
+- **Seconds Progress Bar**:
+  - A slim progress bar below the clock header visually counts elapsed seconds (0–59s) within the current minute.
 - **Hardware PWM Auto-Dimming**:
   - Automatically adjusts LCD backlight brightness smoothly based on ambient lux readings for comfortable day/night viewing.
 - **Modern & High-Contrast UI**:
@@ -25,7 +31,8 @@ Powered by ESP-IDF's native `esp_lcd` driver and internal DMA frame buffering to
 
 ```text
 +-------------------------------------------------------------+
-|  2026/09/06 (SUNDAY)                        12:34           | <- Date / Day & Clock
+|  08:34   2026/09/27 (SATURDAY)                              | <- Time (left) & Date/Day (right)
+|  [████████████████████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░] | <- Seconds progress bar (0-59s)
 |-------------------------------------------------------------|
 |  +-------------------------------------------------------+  |
 |  | ROOM TEMP                                             |  |
@@ -33,8 +40,8 @@ Powered by ESP-IDF's native `esp_lcd` driver and internal DMA frame buffering to
 |  |                 2 5 . 3   C                           |  | <- Main: Extra-large temperature
 |  |                                                       |  |
 |  +-------------------------------------------------------+  |
-|  +-------------------------------------------------------+  |
-|  | BRIGHTNESS                       28.5 lx              |  | <- Ambient Lux Monitor
+|  | BRIGHTNESS                           28.5 lx          |  | <- Compact ambient lux row
+|  | TEMP GRAPH  ___/‾‾‾‾\___/‾‾‾‾‾\__          28C  25C  |  | <- 6-hour history graph
 |  +-------------------------------------------------------+  |
 +-------------------------------------------------------------+
 ```
@@ -73,6 +80,7 @@ ESP32SensorMonitor/
 └── main/
     ├── CMakeLists.txt          # Component dependencies
     ├── idf_component.yml       # Component dependencies (mDNS, etc.)
+    ├── font_32x64.h            # High-resolution 32x64 bitmap font for temperature
     ├── main.c                  # Main application source code
     ├── secrets.example.h       # Wi-Fi credentials template
     └── secrets.h               # Wi-Fi credentials (excluded from Git)

@@ -76,6 +76,16 @@ static float g_sensor_temp = 0.0f;
 static float g_sensor_lux  = 0.0f;
 static bool  g_sensor_valid = false;
 
+// =========================================================================
+// Temperature history ring buffer (6 hours, 1 point per minute = 360 points)
+// =========================================================================
+#define TEMP_HISTORY_SIZE 360
+static float  g_temp_history[TEMP_HISTORY_SIZE];
+static bool   g_temp_history_valid[TEMP_HISTORY_SIZE];
+static int    g_temp_history_head  = 0;   // next write index
+static int    g_temp_history_count = 0;   // how many valid entries exist
+static portMUX_TYPE history_mux = portMUX_INITIALIZER_UNLOCKED;
+
 // Get display color according to temperature
 // <20C: Blue, 20-25C: Cyan, 25-28C: White, 28-30C: Yellow, >=30C: Red
 static uint16_t get_temp_color(float temp, bool is_valid) {
@@ -209,6 +219,106 @@ static void draw_string(int x, int y, const char *str, uint16_t color, int scale
         cur_x += 8 * scale;
         str++;
     }
+}
+
+// Draw a single pixel (with bounds check)
+static void draw_pixel(int x, int y, uint16_t color) {
+    if (x >= 0 && x < LCD_H_RES && y >= 0 && y < LCD_V_RES) {
+        frame_buffer[y * LCD_H_RES + x] = color;
+    }
+}
+
+// Draw temperature history graph
+// x0,y0 = top-left, w = width, h = height
+static void draw_temp_graph(int x0, int y0, int w, int h) {
+    // Snapshot history buffer under lock
+    float hist[TEMP_HISTORY_SIZE];
+    bool  hist_valid[TEMP_HISTORY_SIZE];
+    int   head, count;
+    portENTER_CRITICAL(&history_mux);
+    memcpy(hist,       g_temp_history,       sizeof(hist));
+    memcpy(hist_valid, g_temp_history_valid, sizeof(hist_valid));
+    head  = g_temp_history_head;
+    count = g_temp_history_count;
+    portEXIT_CRITICAL(&history_mux);
+
+    if (count == 0) {
+        draw_string(x0 + 4, y0, "NO DATA YET", COLOR_GRAY, 1);
+        return;
+    }
+
+    // Find min/max for Y scaling
+    float t_min = 100.0f, t_max = -100.0f;
+    for (int i = 0; i < count; i++) {
+        int idx = (head - count + i + TEMP_HISTORY_SIZE) % TEMP_HISTORY_SIZE;
+        if (hist_valid[idx]) {
+            if (hist[idx] < t_min) t_min = hist[idx];
+            if (hist[idx] > t_max) t_max = hist[idx];
+        }
+    }
+    // Ensure at least 2 degree range for visibility
+    if (t_max - t_min < 2.0f) {
+        float mid = (t_max + t_min) / 2.0f;
+        t_min = mid - 1.0f;
+        t_max = mid + 1.0f;
+    }
+    float t_range = t_max - t_min;
+
+    // Horizontal center grid line (dashed)
+    uint16_t grid_color = SWAP16(RGB565(30, 42, 62));
+    for (int gx = x0; gx < x0 + w; gx += 4) {
+        draw_pixel(gx, y0 + h / 2, grid_color);
+    }
+
+    // Plot history: filled area + polyline
+    int prev_px = -1, prev_py = -1;
+    uint16_t area_dark = SWAP16(RGB565(0, 50, 70));
+    for (int i = 0; i < count; i++) {
+        int idx = (head - count + i + TEMP_HISTORY_SIZE) % TEMP_HISTORY_SIZE;
+        if (!hist_valid[idx]) continue;
+
+        int px = x0 + (int)((float)i / (float)(TEMP_HISTORY_SIZE - 1) * (w - 1));
+        float norm = (hist[idx] - t_min) / t_range;
+        int py = y0 + h - 1 - (int)(norm * (h - 2));
+        if (py < y0)         py = y0;
+        if (py > y0 + h - 1) py = y0 + h - 1;
+
+        // Filled area below the line
+        for (int fy = py + 1; fy < y0 + h; fy++) {
+            draw_pixel(px, fy, area_dark);
+        }
+
+        // Polyline segment (Bresenham) from previous point
+        uint16_t line_color = get_temp_color(hist[idx], true);
+        if (prev_px >= 0) {
+            int dx = px - prev_px;
+            int dy = py - prev_py;
+            int adx = dx < 0 ? -dx : dx;
+            int ady = dy < 0 ? -dy : dy;
+            int steps = adx > ady ? adx : ady;
+            if (steps == 0) steps = 1;
+            for (int s = 0; s <= steps; s++) {
+                int lx = prev_px + dx * s / steps;
+                int ly = prev_py + dy * s / steps;
+                draw_pixel(lx, ly, line_color);
+                draw_pixel(lx, ly + 1, line_color); // 2px thick
+            }
+        } else {
+            draw_pixel(px, py, line_color);
+        }
+        prev_px = px;
+        prev_py = py;
+    }
+
+    // Y-axis labels: min and max temperature
+    char label_min[8], label_max[8];
+    snprintf(label_min, sizeof(label_min), "%.0fC", t_min);
+    snprintf(label_max, sizeof(label_max), "%.0fC", t_max);
+    int lw_max = (int)strlen(label_max) * 8;
+    int lw_min = (int)strlen(label_min) * 8;
+    draw_string(x0 + w - lw_max - 2, y0,              label_max, COLOR_GRAY, 1);
+    draw_string(x0 + w - lw_min - 2, y0 + h - 16,     label_min, COLOR_GRAY, 1);
+    draw_string(x0 + 2,              y0 + h - 16,      "6H",      COLOR_GRAY, 1);
 }
 
 // Draw 32x64 high-resolution string (smooth native bitmap font for temperature display)
@@ -410,6 +520,29 @@ static void sensor_task(void *pvParameters) {
     }
 }
 
+// Record current temperature into the history buffer every 60 seconds
+static void temp_history_task(void *pvParameters) {
+    while (1) {
+        vTaskDelay(pdMS_TO_TICKS(60000)); // wait 1 minute
+
+        float temp;
+        bool  valid;
+        portENTER_CRITICAL(&sensor_mux);
+        temp  = g_sensor_temp;
+        valid = g_sensor_valid;
+        portEXIT_CRITICAL(&sensor_mux);
+
+        portENTER_CRITICAL(&history_mux);
+        g_temp_history[g_temp_history_head]       = temp;
+        g_temp_history_valid[g_temp_history_head] = valid;
+        g_temp_history_head = (g_temp_history_head + 1) % TEMP_HISTORY_SIZE;
+        if (g_temp_history_count < TEMP_HISTORY_SIZE) {
+            g_temp_history_count++;
+        }
+        portEXIT_CRITICAL(&history_mux);
+    }
+}
+
 // =========================================================================
 // Wi-Fi & SNTP Initialization
 // =========================================================================
@@ -489,21 +622,43 @@ static void clock_task(void *pvParameters) {
 
         if (timeinfo.tm_year > (2020 - 1900)) {
             // -------------------------------------------------------------
-            // 1. Header: Date / Day (Left) & Time (Right: scale=2)
+            // 1. Header: Time (Left, scale=2) & Date/Day (Right)
             // -------------------------------------------------------------
+            // HH:MM on the left
+            char time_buf[16];
+            snprintf(time_buf, sizeof(time_buf), "%02d:%02d", timeinfo.tm_hour, timeinfo.tm_min);
+            draw_string(14, 4, time_buf, COLOR_CYAN, 2);
+
+            // Date / Day on the right
             char date_day_buf[64];
             snprintf(date_day_buf, sizeof(date_day_buf), "%04d/%02d/%02d (%s)",
                      timeinfo.tm_year + 1900,
                      timeinfo.tm_mon + 1,
                      timeinfo.tm_mday,
                      days_full[timeinfo.tm_wday]);
-            draw_string(14, 10, date_day_buf, COLOR_GRAY, 1);
+            // Right-align: each char is 8px wide at scale=1
+            int date_w = (int)strlen(date_day_buf) * 8;
+            draw_string(312 - date_w, 10, date_day_buf, COLOR_GRAY, 1);
 
-            char time_buf[16];
-            snprintf(time_buf, sizeof(time_buf), "%02d:%02d", timeinfo.tm_hour, timeinfo.tm_min);
-            draw_string(230, 4, time_buf, COLOR_CYAN, 2);
+            // Seconds progress bar (0-59 => fills bar width proportionally)
+            // Bar area: x=10, y=28, w=300, h=5
+            {
+                int bar_x = 10, bar_y = 28, bar_w = 300, bar_h = 4;
+                int filled = (int)((float)timeinfo.tm_sec / 59.0f * bar_w);
+                if (filled > bar_w) filled = bar_w;
+                // Background track
+                fill_rect(bar_x, bar_y, bar_w, bar_h, COLOR_CARD_BG);
+                // Filled portion (cyan with slight gradient effect: 2px bright, 2px dim)
+                uint16_t bar_bright = SWAP16(RGB565(0, 200, 220));
+                uint16_t bar_dim    = SWAP16(RGB565(0, 120, 140));
+                fill_rect(bar_x, bar_y,     filled, 2, bar_bright);
+                fill_rect(bar_x, bar_y + 2, filled, 2, bar_dim);
+                // Remaining track
+                uint16_t bar_empty = SWAP16(RGB565(25, 35, 55));
+                fill_rect(bar_x + filled, bar_y, bar_w - filled, bar_h, bar_empty);
+            }
 
-            fill_rect(10, 36, 300, 1, COLOR_BORDER);
+            fill_rect(10, 34, 300, 1, COLOR_BORDER);
 
             // -------------------------------------------------------------
             // 2. Main area: Large temperature display (Center card: scale=4)
@@ -537,12 +692,11 @@ static void clock_task(void *pvParameters) {
             draw_string_32x64(text_x, 50, temp_main_str, temp_color);
 
             // -------------------------------------------------------------
-            // 3. Footer area: Ambient illuminance (LUX)
+            // 3. Footer row: Ambient illuminance (compact single line)
             // -------------------------------------------------------------
-            fill_rect(10, 126, 300, 36, COLOR_CARD_BG);
-            draw_round_rect(10, 126, 300, 36, 3, COLOR_BORDER);
-
-            draw_string(20, 136, "BRIGHTNESS", COLOR_GRAY, 1);
+            fill_rect(10, 126, 300, 18, COLOR_CARD_BG);
+            draw_round_rect(10, 126, 300, 18, 2, COLOR_BORDER);
+            draw_string(20, 130, "BRIGHTNESS", COLOR_GRAY, 1);
 
             char lux_str[32];
             if (is_valid) {
@@ -554,7 +708,15 @@ static void clock_task(void *pvParameters) {
             } else {
                 snprintf(lux_str, sizeof(lux_str), "--- lx");
             }
-            draw_string(170, 132, lux_str, COLOR_YELLOW, 2);
+            draw_string(200, 130, lux_str, COLOR_YELLOW, 1);
+
+            // -------------------------------------------------------------
+            // 4. Temperature history graph (6 hours, bottom area)
+            // -------------------------------------------------------------
+            fill_rect(10, 147, 300, 18, COLOR_CARD_BG);
+            draw_round_rect(10, 147, 300, 18, 2, COLOR_BORDER);
+            draw_string(14, 151, "TEMP GRAPH", COLOR_GRAY, 1);
+            draw_temp_graph(90, 149, 216, 14);
 
         } else {
             draw_string(60, 75, "CONNECTING & NTP...", COLOR_CYAN, 1);
@@ -579,6 +741,7 @@ void app_main(void) {
     ESP_LOGI(TAG, "Initializing Wi-Fi & SNTP...");
     init_wifi_sntp();
 
-    xTaskCreatePinnedToCore(sensor_task, "sensor_task", 4096, NULL, 4, NULL, 0);
-    xTaskCreatePinnedToCore(clock_task, "clock_task", 4096, NULL, 5, NULL, 1);
+    xTaskCreatePinnedToCore(sensor_task,       "sensor_task",    4096, NULL, 4, NULL, 0);
+    xTaskCreatePinnedToCore(temp_history_task, "temp_hist_task", 2048, NULL, 3, NULL, 0);
+    xTaskCreatePinnedToCore(clock_task,        "clock_task",     4096, NULL, 5, NULL, 1);
 }
