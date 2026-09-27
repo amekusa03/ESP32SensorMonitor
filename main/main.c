@@ -231,10 +231,12 @@ static void draw_pixel(int x, int y, uint16_t color) {
 // Draw temperature history graph
 // x0,y0 = top-left, w = width, h = height
 static void draw_temp_graph(int x0, int y0, int w, int h) {
-    // Snapshot history buffer under lock
-    float hist[TEMP_HISTORY_SIZE];
-    bool  hist_valid[TEMP_HISTORY_SIZE];
-    int   head, count;
+    // Static arrays to eliminate stack overhead in clock_task
+    static float hist[TEMP_HISTORY_SIZE];
+    static bool  hist_valid[TEMP_HISTORY_SIZE];
+    static int   line_y[320]; // max LCD width
+
+    int head, count;
     portENTER_CRITICAL(&history_mux);
     memcpy(hist,       g_temp_history,       sizeof(hist));
     memcpy(hist_valid, g_temp_history_valid, sizeof(hist_valid));
@@ -264,18 +266,57 @@ static void draw_temp_graph(int x0, int y0, int w, int h) {
     }
     float t_range = t_max - t_min;
 
-    // Horizontal center grid line (dashed)
+    // Build per-pixel Y lookup table by interpolating between data points
+    // line_y[col] = y pixel for that x column (-1 = no data)
+    for (int c = 0; c < w; c++) line_y[c] = -1;
+
+    int prev_i_px = -1, prev_i_py = -1;
+    for (int i = 0; i < count; i++) {
+        int idx = (head - count + i + TEMP_HISTORY_SIZE) % TEMP_HISTORY_SIZE;
+        if (!hist_valid[idx]) { prev_i_px = -1; prev_i_py = -1; continue; }
+
+        int px = (int)((float)i / (float)(TEMP_HISTORY_SIZE - 1) * (w - 1));
+        float norm = (hist[idx] - t_min) / t_range;
+        int py = h - 1 - (int)(norm * (h - 2));
+        if (py < 0)     py = 0;
+        if (py > h - 1) py = h - 1;
+
+        if (prev_i_px >= 0) {
+            // Interpolate y for every x column between prev and current
+            int dx = px - prev_i_px;
+            int dy = py - prev_i_py;
+            for (int c = prev_i_px; c <= px; c++) {
+                int iy = prev_i_py + dy * (c - prev_i_px) / (dx == 0 ? 1 : dx);
+                if (c >= 0 && c < w) line_y[c] = iy;
+            }
+        } else {
+            if (px >= 0 && px < w) line_y[px] = py;
+        }
+        prev_i_px = px;
+        prev_i_py = py;
+    }
+
+    // Pass 1: filled area (bar-style, every column from line_y down to bottom)
+    uint16_t area_color = SWAP16(RGB565(0, 60, 85));
+    for (int c = 0; c < w; c++) {
+        if (line_y[c] < 0) continue;
+        int abs_y = y0 + line_y[c];
+        for (int fy = abs_y + 1; fy < y0 + h; fy++) {
+            draw_pixel(x0 + c, fy, area_color);
+        }
+    }
+
+    // Horizontal center grid line (dashed, drawn over fill)
     uint16_t grid_color = SWAP16(RGB565(30, 42, 62));
     for (int gx = x0; gx < x0 + w; gx += 4) {
         draw_pixel(gx, y0 + h / 2, grid_color);
     }
 
-    // Plot history: filled area + polyline
+    // Pass 2: polyline on top (2px thick, color by temperature)
     int prev_px = -1, prev_py = -1;
-    uint16_t area_dark = SWAP16(RGB565(0, 50, 70));
     for (int i = 0; i < count; i++) {
         int idx = (head - count + i + TEMP_HISTORY_SIZE) % TEMP_HISTORY_SIZE;
-        if (!hist_valid[idx]) continue;
+        if (!hist_valid[idx]) { prev_px = -1; prev_py = -1; continue; }
 
         int px = x0 + (int)((float)i / (float)(TEMP_HISTORY_SIZE - 1) * (w - 1));
         float norm = (hist[idx] - t_min) / t_range;
@@ -283,12 +324,6 @@ static void draw_temp_graph(int x0, int y0, int w, int h) {
         if (py < y0)         py = y0;
         if (py > y0 + h - 1) py = y0 + h - 1;
 
-        // Filled area below the line
-        for (int fy = py + 1; fy < y0 + h; fy++) {
-            draw_pixel(px, fy, area_dark);
-        }
-
-        // Polyline segment (Bresenham) from previous point
         uint16_t line_color = get_temp_color(hist[idx], true);
         if (prev_px >= 0) {
             int dx = px - prev_px;
@@ -301,10 +336,11 @@ static void draw_temp_graph(int x0, int y0, int w, int h) {
                 int lx = prev_px + dx * s / steps;
                 int ly = prev_py + dy * s / steps;
                 draw_pixel(lx, ly, line_color);
-                draw_pixel(lx, ly + 1, line_color); // 2px thick
+                draw_pixel(lx, ly + 1, line_color);
             }
         } else {
             draw_pixel(px, py, line_color);
+            draw_pixel(px, py + 1, line_color);
         }
         prev_px = px;
         prev_py = py;
@@ -356,7 +392,7 @@ static void draw_string_32x64(int x, int y, const char *str, uint16_t color) {
 #define LCD_BK_LIGHT_MODE        LEDC_LOW_SPEED_MODE
 #define LCD_BK_LIGHT_CHANNEL     LEDC_CHANNEL_0
 #define LCD_BK_LIGHT_DUTY_RES    LEDC_TIMER_8_BIT // 0 - 255
-#define LCD_BK_LIGHT_FREQ_HZ     5000
+#define LCD_BK_LIGHT_FREQ_HZ     1000
 
 static void init_backlight_pwm(void) {
     ledc_timer_config_t ledc_timer = {
@@ -503,6 +539,7 @@ static void fetch_sensor_data(void) {
         } else {
             ESP_LOGW(TAG, "Sensor API HTTP status: %d", status_code);
         }
+        esp_http_client_close(client);
     } else {
         ESP_LOGW(TAG, "Failed to connect to Sensor API: %s", esp_err_to_name(err));
     }
@@ -741,7 +778,7 @@ void app_main(void) {
     ESP_LOGI(TAG, "Initializing Wi-Fi & SNTP...");
     init_wifi_sntp();
 
-    xTaskCreatePinnedToCore(sensor_task,       "sensor_task",    4096, NULL, 4, NULL, 0);
-    xTaskCreatePinnedToCore(temp_history_task, "temp_hist_task", 2048, NULL, 3, NULL, 0);
-    xTaskCreatePinnedToCore(clock_task,        "clock_task",     4096, NULL, 5, NULL, 1);
+    xTaskCreatePinnedToCore(sensor_task,       "sensor_task",    6144, NULL, 4, NULL, 0);
+    xTaskCreatePinnedToCore(temp_history_task, "temp_hist_task", 3072, NULL, 3, NULL, 0);
+    xTaskCreatePinnedToCore(clock_task,        "clock_task",     8192, NULL, 5, NULL, 1);
 }
