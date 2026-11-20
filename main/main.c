@@ -2,6 +2,7 @@
 #include <string.h>
 #include <time.h>
 #include <sys/time.h>
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/event_groups.h"
@@ -75,6 +76,10 @@ static portMUX_TYPE sensor_mux = portMUX_INITIALIZER_UNLOCKED;
 static float g_sensor_temp = 0.0f;
 static float g_sensor_lux  = 0.0f;
 static bool  g_sensor_valid = false;
+static float g_sensor_outdoor_temp = 0.0f;
+static float g_sensor_outdoor_vbat = 0.0f;
+static int   g_sensor_outdoor_last_seen = 0;
+static bool  g_sensor_outdoor_valid = false;
 
 // =========================================================================
 // Temperature history ring buffer (6 hours, 1 point per minute = 360 points)
@@ -357,22 +362,51 @@ static void draw_temp_graph(int x0, int y0, int w, int h) {
     draw_string(x0 + 2,              y0 + h - 16,      "6H",      COLOR_GRAY, 1);
 }
 
-// Draw 32x64 high-resolution string (smooth native bitmap font for temperature display)
-static void draw_string_32x64(int x, int y, const char *str, uint16_t color) {
+// Draw string with scaling and clipping rectangle [cx1, cy1, cx2, cy2)
+static void draw_string_clip(int x, int y, const char *str, uint16_t color, int scale,
+                             int cx1, int cy1, int cx2, int cy2) {
+    int cur_x = x;
+    while (*str) {
+        const uint8_t *glyph = get_font_glyph(*str);
+        for (int row = 0; row < 16; row++) {
+            uint8_t b = glyph[row];
+            for (int col = 0; col < 8; col++) {
+                if (b & (0x80 >> col)) {
+                    for (int dy = 0; dy < scale; dy++) {
+                        int py = y + row * scale + dy;
+                        if (py < cy1 || py >= cy2 || py < 0 || py >= LCD_V_RES) continue;
+                        for (int dx = 0; dx < scale; dx++) {
+                            int px = cur_x + col * scale + dx;
+                            if (px >= cx1 && px < cx2 && px >= 0 && px < LCD_H_RES) {
+                                frame_buffer[py * LCD_H_RES + px] = color;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        cur_x += 8 * scale;
+        str++;
+    }
+}
+
+// Draw 32x64 string with clipping rectangle [cx1, cy1, cx2, cy2)
+static void draw_string_32x64_clip(int x, int y, const char *str, uint16_t color,
+                                  int cx1, int cy1, int cx2, int cy2) {
     int cur_x = x;
     while (*str) {
         const uint8_t *glyph = get_font_32x64_glyph(*str);
         if (glyph) {
             for (int row = 0; row < 64; row++) {
                 int py = y + row;
-                if (py < 0 || py >= LCD_V_RES) continue;
+                if (py < cy1 || py >= cy2 || py < 0 || py >= LCD_V_RES) continue;
                 for (int b = 0; b < 4; b++) {
                     uint8_t byte_val = glyph[row * 4 + b];
                     if (byte_val == 0) continue;
                     for (int bit = 0; bit < 8; bit++) {
                         if (byte_val & (0x80 >> bit)) {
                             int px = cur_x + b * 8 + bit;
-                            if (px >= 0 && px < LCD_H_RES) {
+                            if (px >= cx1 && px < cx2 && px >= 0 && px < LCD_H_RES) {
                                 frame_buffer[py * LCD_H_RES + px] = color;
                             }
                         }
@@ -385,14 +419,102 @@ static void draw_string_32x64(int x, int y, const char *str, uint16_t color) {
     }
 }
 
+static inline void __attribute__((unused)) draw_string_32x64(int x, int y, const char *str, uint16_t color) {
+    draw_string_32x64_clip(x, y, str, color, 0, 0, LCD_H_RES, LCD_V_RES);
+}
+
+enum {
+    CARD_PAGE_ROOM = 0,
+    CARD_PAGE_LIGHT = 1,
+    CARD_PAGE_OUTDOOR = 2,
+    CARD_PAGE_COUNT = 3
+};
+
+// Draw content of a specific page on the main card (offset_x allows smooth horizontal sliding)
+static void draw_card_page(int page, int offset_x,
+                           float cur_temp, bool temp_valid,
+                           float cur_lux, bool lux_valid,
+                           float out_temp, float out_vbat, bool out_valid) {
+    const int cx1 = 12, cy1 = 44, cx2 = 308, cy2 = 118;
+
+    if (page == CARD_PAGE_ROOM) {
+        draw_string_clip(20 + offset_x, 48, "ROOM TEMP", COLOR_GRAY, 1, cx1, cy1, cx2, cy2);
+
+        char temp_str[24];
+        if (temp_valid) {
+            snprintf(temp_str, sizeof(temp_str), "%.1f C", cur_temp);
+        } else {
+            snprintf(temp_str, sizeof(temp_str), "--.- C");
+        }
+        int text_len = strlen(temp_str);
+        int text_width = text_len * 32;
+        int text_x = 10 + offset_x + (300 - text_width) / 2;
+        uint16_t color = get_temp_color(cur_temp, temp_valid);
+        draw_string_32x64_clip(text_x, 50, temp_str, color, cx1, cy1, cx2, cy2);
+
+    } else if (page == CARD_PAGE_LIGHT) {
+        draw_string_clip(20 + offset_x, 48, "BRIGHTNESS", COLOR_GRAY, 1, cx1, cy1, cx2, cy2);
+
+        char lux_num_str[24];
+        if (lux_valid) {
+            if (cur_lux >= 1000.0f) {
+                snprintf(lux_num_str, sizeof(lux_num_str), "%.0f", cur_lux);
+            } else {
+                snprintf(lux_num_str, sizeof(lux_num_str), "%.1f", cur_lux);
+            }
+        } else {
+            snprintf(lux_num_str, sizeof(lux_num_str), "---");
+        }
+        int num_len = strlen(lux_num_str);
+        int num_width = num_len * 32;
+        int unit_width = 2 * 16; // "lx" (2 chars, scale=2 is 16px wide each -> 32px)
+        int total_width = num_width + 8 + unit_width;
+        int start_x = 10 + offset_x + (300 - total_width) / 2;
+
+        draw_string_32x64_clip(start_x, 50, lux_num_str, COLOR_YELLOW, cx1, cy1, cx2, cy2);
+        draw_string_clip(start_x + num_width + 8, 76, "lx", COLOR_YELLOW, 2, cx1, cy1, cx2, cy2);
+
+    } else if (page == CARD_PAGE_OUTDOOR) {
+        draw_string_clip(20 + offset_x, 48, "OUTDOOR TEMP", COLOR_CYAN, 1, cx1, cy1, cx2, cy2);
+
+        if (out_valid) {
+            char vbat_str[16];
+            snprintf(vbat_str, sizeof(vbat_str), "%.2fV", out_vbat);
+            int vbat_w = strlen(vbat_str) * 8;
+            draw_string_clip(300 - vbat_w + offset_x, 48, vbat_str, COLOR_GRAY, 1, cx1, cy1, cx2, cy2);
+        }
+
+        char out_str[24];
+        if (out_valid) {
+            snprintf(out_str, sizeof(out_str), "%.1f C", out_temp);
+        } else {
+            snprintf(out_str, sizeof(out_str), "--.- C");
+        }
+        int text_len = strlen(out_str);
+        int text_width = text_len * 32;
+        int text_x = 10 + offset_x + (300 - text_width) / 2;
+        uint16_t color = get_temp_color(out_temp, out_valid);
+        draw_string_32x64_clip(text_x, 50, out_str, color, cx1, cy1, cx2, cy2);
+    }
+}
+
 // =========================================================================
-// LCD Backlight LEDC PWM Auto-Dimming
+// LCD Backlight LEDC PWM Time-Based Auto-Dimming
 // =========================================================================
 #define LCD_BK_LIGHT_TIMER       LEDC_TIMER_0
 #define LCD_BK_LIGHT_MODE        LEDC_LOW_SPEED_MODE
 #define LCD_BK_LIGHT_CHANNEL     LEDC_CHANNEL_0
 #define LCD_BK_LIGHT_DUTY_RES    LEDC_TIMER_8_BIT // 0 - 255
 #define LCD_BK_LIGHT_FREQ_HZ     1000
+
+// Time-based dimming configuration
+#define BACKLIGHT_DAY_HOUR_START     7   // 07:00 - 21:00: Day (100%)
+#define BACKLIGHT_EVENING_HOUR_START 21  // 21:00 - 23:00: Evening (40%)
+#define BACKLIGHT_NIGHT_HOUR_START   23  // 23:00 - 07:00: Night (10%)
+
+#define BACKLIGHT_DUTY_DAY           255 // 100%
+#define BACKLIGHT_DUTY_EVENING       100 // ~40%
+#define BACKLIGHT_DUTY_NIGHT         25  // ~10%
 
 static void init_backlight_pwm(void) {
     ledc_timer_config_t ledc_timer = {
@@ -410,37 +532,34 @@ static void init_backlight_pwm(void) {
         .timer_sel      = LCD_BK_LIGHT_TIMER,
         .intr_type      = LEDC_INTR_DISABLE,
         .gpio_num       = PIN_NUM_BK_LIGHT,
-        .duty           = 255, // 100% on startup
+        .duty           = BACKLIGHT_DUTY_DAY, // default daytime
         .hpoint         = 0
     };
     ESP_ERROR_CHECK(ledc_channel_config(&ledc_channel));
     ledc_fade_func_install(0);
 }
 
-// Calculate target duty cycle according to illuminance and smoothly fade (500ms)
-static void update_backlight_by_lux(float lux, bool is_valid) {
-    static uint32_t last_duty = 255;
-    uint32_t target_duty = 255;
-    if (is_valid) {
-        if (lux <= 2.0f) {
-            target_duty = 25; // Minimum 10% (dark / sleeping time)
-        } else if (lux < 20.0f) {
-            // Smoothly interpolate from 2lx (25) to 20lx (100)
-            target_duty = 25 + (uint32_t)((lux - 2.0f) / 18.0f * (100 - 25));
-        } else if (lux < 100.0f) {
-            // Smoothly interpolate from 20lx (100) to 100lx (255)
-            target_duty = 100 + (uint32_t)((lux - 20.0f) / 80.0f * (255 - 100));
+// Update backlight duty cycle based on current time (fades smoothly in 1000ms)
+static void update_backlight_by_time(const struct tm *timeinfo) {
+    static uint32_t last_duty = BACKLIGHT_DUTY_DAY;
+    uint32_t target_duty = BACKLIGHT_DUTY_DAY;
+
+    if (timeinfo && timeinfo->tm_year > (2020 - 1900)) {
+        int hour = timeinfo->tm_hour;
+        if (hour >= BACKLIGHT_DAY_HOUR_START && hour < BACKLIGHT_EVENING_HOUR_START) {
+            target_duty = BACKLIGHT_DUTY_DAY;
+        } else if (hour >= BACKLIGHT_EVENING_HOUR_START && hour < BACKLIGHT_NIGHT_HOUR_START) {
+            target_duty = BACKLIGHT_DUTY_EVENING;
         } else {
-            target_duty = 255; // 100% for >= 100lx
+            target_duty = BACKLIGHT_DUTY_NIGHT;
         }
     }
-    if (target_duty > 255) target_duty = 255;
-    if (target_duty < 25) target_duty = 25;
 
     if (target_duty != last_duty) {
         last_duty = target_duty;
-        ledc_set_fade_with_time(LCD_BK_LIGHT_MODE, LCD_BK_LIGHT_CHANNEL, target_duty, 500);
+        ledc_set_fade_with_time(LCD_BK_LIGHT_MODE, LCD_BK_LIGHT_CHANNEL, target_duty, 1000);
         ledc_fade_start(LCD_BK_LIGHT_MODE, LCD_BK_LIGHT_CHANNEL, LEDC_FADE_NO_WAIT);
+        ESP_LOGI(TAG, "Backlight time dimming changed to duty: %u", (unsigned int)target_duty);
     }
 }
 
@@ -519,8 +638,12 @@ static void fetch_sensor_data(void) {
                 response_buffer[total_read] = '\0';
                 cJSON *root = cJSON_Parse(response_buffer);
                 if (root) {
-                    cJSON *item_lux  = cJSON_GetObjectItem(root, "lux");
-                    cJSON *item_temp = cJSON_GetObjectItem(root, "temp_celsius");
+                    cJSON *item_lux       = cJSON_GetObjectItem(root, "lux");
+                    cJSON *item_temp      = cJSON_GetObjectItem(root, "temp_celsius");
+                    cJSON *item_out_temp  = cJSON_GetObjectItem(root, "outdoor_temp_celsius");
+                    cJSON *item_out_vbat  = cJSON_GetObjectItem(root, "outdoor_battery_voltage");
+                    cJSON *item_out_seen  = cJSON_GetObjectItem(root, "outdoor_last_seen_sec");
+                    cJSON *item_out_valid = cJSON_GetObjectItem(root, "outdoor_valid");
 
                     portENTER_CRITICAL(&sensor_mux);
                     if (cJSON_IsNumber(item_lux)) {
@@ -530,9 +653,23 @@ static void fetch_sensor_data(void) {
                         g_sensor_temp = (float)item_temp->valuedouble;
                     }
                     g_sensor_valid = true;
+
+                    if (cJSON_IsNumber(item_out_temp)) {
+                        g_sensor_outdoor_temp = (float)item_out_temp->valuedouble;
+                    }
+                    if (cJSON_IsNumber(item_out_vbat)) {
+                        g_sensor_outdoor_vbat = (float)item_out_vbat->valuedouble;
+                    }
+                    if (cJSON_IsNumber(item_out_seen)) {
+                        g_sensor_outdoor_last_seen = item_out_seen->valueint;
+                    }
+                    if (cJSON_IsBool(item_out_valid)) {
+                        g_sensor_outdoor_valid = cJSON_IsTrue(item_out_valid);
+                    }
                     portEXIT_CRITICAL(&sensor_mux);
 
-                    ESP_LOGI(TAG, "Sensor update: Temp=%.1f C, Lux=%.1f", g_sensor_temp, g_sensor_lux);
+                    ESP_LOGI(TAG, "Sensor update: Room=%.1f C, Lux=%.1f, Outdoor=%.1f C (%.2fV, valid=%d)",
+                             g_sensor_temp, g_sensor_lux, g_sensor_outdoor_temp, g_sensor_outdoor_vbat, g_sensor_outdoor_valid);
                     cJSON_Delete(root);
                 }
             }
@@ -648,6 +785,12 @@ static void init_wifi_sntp(void) {
 static const char* days_full[] = {"SUNDAY", "MONDAY", "TUESDAY", "WEDNESDAY", "THURSDAY", "FRIDAY", "SATURDAY"};
 
 static void clock_task(void *pvParameters) {
+    static int s_current_page = CARD_PAGE_ROOM;
+    static int s_target_page = CARD_PAGE_ROOM;
+    static bool s_animating = false;
+    static int64_t s_anim_start_us = 0;
+    const int64_t ANIM_DURATION_US = 2200 * 1000; // 2200ms (2.2s) slow smooth transition
+
     while (1) {
         time_t now;
         struct tm timeinfo;
@@ -698,35 +841,70 @@ static void clock_task(void *pvParameters) {
             fill_rect(10, 34, 300, 1, COLOR_BORDER);
 
             // -------------------------------------------------------------
-            // 2. Main area: Large temperature display (Center card: scale=4)
+            // 2. Main area: Large display with smooth horizontal scroll
             // -------------------------------------------------------------
             float cur_temp = 0.0f;
             float cur_lux  = 0.0f;
             bool  is_valid = false;
+            float out_temp = 0.0f;
+            float out_vbat = 0.0f;
+            bool  out_valid = false;
 
             portENTER_CRITICAL(&sensor_mux);
-            cur_temp = g_sensor_temp;
-            cur_lux  = g_sensor_lux;
-            is_valid = g_sensor_valid;
+            cur_temp  = g_sensor_temp;
+            cur_lux   = g_sensor_lux;
+            is_valid  = g_sensor_valid;
+            out_temp  = g_sensor_outdoor_temp;
+            out_vbat  = g_sensor_outdoor_vbat;
+            out_valid = g_sensor_outdoor_valid;
             portEXIT_CRITICAL(&sensor_mux);
 
-            update_backlight_by_lux(cur_lux, is_valid);
+            update_backlight_by_time(&timeinfo);
 
+            // Determine target page in 30s cycle:
+            // 0 - 19s: ROOM TEMP (20s)
+            // 20 - 24s: BRIGHTNESS (5s)
+            // 25 - 29s: OUTDOOR TEMP (5s)
+            int cycle_sec = timeinfo.tm_sec % 30;
+            int desired_page = CARD_PAGE_ROOM;
+            if (cycle_sec >= 20 && cycle_sec < 25) {
+                desired_page = CARD_PAGE_LIGHT;
+            } else if (cycle_sec >= 25 && cycle_sec < 30) {
+                desired_page = CARD_PAGE_OUTDOOR;
+            } else {
+                desired_page = CARD_PAGE_ROOM;
+            }
+
+            if (!s_animating && desired_page != s_current_page) {
+                s_animating = true;
+                s_target_page = desired_page;
+                s_anim_start_us = esp_timer_get_time();
+            }
+
+            // Draw card frame and background
             fill_rect(10, 42, 300, 78, COLOR_CARD_BG);
             draw_round_rect(10, 42, 300, 78, 4, COLOR_BORDER);
-            draw_string(20, 48, "ROOM TEMP", COLOR_GRAY, 1);
 
-            char temp_main_str[24];
-            if (is_valid) {
-                snprintf(temp_main_str, sizeof(temp_main_str), "%.1f C", cur_temp);
+            if (s_animating) {
+                int64_t elapsed_us = esp_timer_get_time() - s_anim_start_us;
+                if (elapsed_us >= ANIM_DURATION_US) {
+                    s_animating = false;
+                    s_current_page = s_target_page;
+                    draw_card_page(s_current_page, 0, cur_temp, is_valid, cur_lux, is_valid, out_temp, out_vbat, out_valid);
+                } else {
+                    float t = (float)elapsed_us / (float)ANIM_DURATION_US;
+                    // Smoothstep ease-in-out: t * t * (3 - 2 * t) for a gentle, slow transition
+                    float ease = t * t * (3.0f - 2.0f * t);
+                    int shift = (int)(ease * 300.0f);
+                    int offset_out = -shift;
+                    int offset_in = 300 - shift;
+
+                    draw_card_page(s_current_page, offset_out, cur_temp, is_valid, cur_lux, is_valid, out_temp, out_vbat, out_valid);
+                    draw_card_page(s_target_page, offset_in, cur_temp, is_valid, cur_lux, is_valid, out_temp, out_vbat, out_valid);
+                }
             } else {
-                snprintf(temp_main_str, sizeof(temp_main_str), "--.- C");
+                draw_card_page(s_current_page, 0, cur_temp, is_valid, cur_lux, is_valid, out_temp, out_vbat, out_valid);
             }
-            int text_len = strlen(temp_main_str);
-            int text_width = text_len * 32;
-            int text_x = 10 + (300 - text_width) / 2;
-            uint16_t temp_color = get_temp_color(cur_temp, is_valid);
-            draw_string_32x64(text_x, 50, temp_main_str, temp_color);
 
             // -------------------------------------------------------------
             // 3. Footer row: Ambient illuminance (compact single line)
@@ -760,7 +938,11 @@ static void clock_task(void *pvParameters) {
         }
 
         esp_lcd_panel_draw_bitmap(panel_handle, 0, 0, LCD_H_RES, LCD_V_RES, frame_buffer);
-        vTaskDelay(pdMS_TO_TICKS(200));
+        if (s_animating) {
+            vTaskDelay(pdMS_TO_TICKS(30)); // ~33 FPS during smooth transition
+        } else {
+            vTaskDelay(pdMS_TO_TICKS(200)); // Normal 5 FPS
+        }
     }
 }
 
